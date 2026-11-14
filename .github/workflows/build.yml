@@ -20,7 +20,9 @@
 #   2. app/build.gradle.kts 中 storeFile = file(...) 相对 app/ 目录，故路径需写成 ../keystore/xxx；
 #   3. getVersionCode() 每次 Gradle 配置都会自增并写回 app/version.properties，构建后需恢复；
 #   4. compileSdk/targetSdk = 37，且 BuildVersionUtils.kt 引用 Build.VERSION_CODES.CINNAMON_BUN
-#      （API 37 常量），必须安装 Android SDK Platform 37，降级到 36 会直接编译失败。
+#      （API 37 常量），必须安装 Android SDK Platform 37，降级到 36 会直接编译失败；
+#      而 SDK 仓库中该平台的包名带修订号（android-37.0/37.1/37.2），没有裸的 android-37，
+#      安装脚本需自动探测并建立 AGP 所需的 platforms/android-37 目录。
 
 name: Build LuckyTool
 
@@ -42,13 +44,6 @@ on:
         description: '构建后创建/更新 GitHub Release'
         default: false
         type: boolean
-      sdk_channel:
-        description: 'SDK 更新渠道（0=稳定版，1=预览版；SDK 37 未进稳定渠道时选 1）'
-        required: true
-        default: '0'
-        type: choice
-        options: ['0', '1']
-
 permissions:
   contents: write
 
@@ -86,9 +81,6 @@ jobs:
       # 必然以 exit 1 失败（实测日志：Failed to find package 'tools'）。
       # ubuntu-latest 镜像自带完整的 Android SDK 与 cmdline-tools/latest，直接复用即可。
       - name: 安装 SDK 平台与构建工具
-        env:
-          # 非 workflow_dispatch 触发时为空串，脚本按稳定渠道处理
-          SDK_CHANNEL: ${{ inputs.sdk_channel || '0' }}
         run: |
           set -euo pipefail
 
@@ -104,27 +96,47 @@ jobs:
 
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
-          CHANNEL="${SDK_CHANNEL:-0}"
-          # 依次尝试稳定渠道与预览渠道；SDK 37 若尚未进入稳定渠道，靠后面的渠道兜底
-          CANDIDATES="${CHANNEL} 0 1 2 3"
-          INSTALLED=""
-          for c in ${CANDIDATES}; do
-            if sdkmanager --channel="${c}" \
-                --install "platforms;android-${COMPILE_SDK}" "platform-tools" >/dev/null 2>&1; then
-              INSTALLED="${c}"
+          # channel=3 覆盖稳定版与预览版。SDK 37 的包名带修订号（android-37.0/37.1/37.2），
+          # 并不存在裸的 platforms;android-37，直接写死会报 "Failed to find package"。
+          echo "可用 android-37* 平台包:"
+          sdkmanager --channel=3 --list 2>/dev/null \
+            | grep -oE 'platforms;android-37([.][0-9]+)?(-[a-z0-9]+)?' | sort -u || true
+
+          CANDIDATES=(
+            "platforms;android-${COMPILE_SDK}"
+            "platforms;android-${COMPILE_SDK}.2"
+            "platforms;android-${COMPILE_SDK}.1"
+            "platforms;android-${COMPILE_SDK}.0"
+          )
+          PKG=""
+          for p in "${CANDIDATES[@]}"; do
+            if sdkmanager --channel=3 --install "${p}" "platform-tools" >/dev/null 2>&1; then
+              PKG="${p}"
               break
             fi
           done
-          if [ -z "${INSTALLED}" ]; then
-            echo "::error::无法安装 platforms;android-${COMPILE_SDK}（已尝试渠道 ${CANDIDATES}）。"
-            echo "::error::本项目 compileSdk/targetSdk=37 且引用 API 37 常量，降级到 SDK 36 无法编译。"
-            sdkmanager --channel=3 --list 2>&1 | grep -i "android-37" | head -10 || true
+          if [ -z "${PKG}" ]; then
+            echo "::error::无法安装任何 android-${COMPILE_SDK}* 平台包"
             exit 1
           fi
-          echo "已安装 platforms;android-${COMPILE_SDK}（渠道 ${INSTALLED}）"
+          echo "已安装: ${PKG}"
+          echo "platforms 目录:"
+          ls -1 "${ANDROID_SDK_ROOT}/platforms" || true
+
+          # AGP 按 compileSdk=37 查找 platforms/android-37；修订号目录需做一次兼容链接
+          if [ ! -d "${ANDROID_SDK_ROOT}/platforms/android-${COMPILE_SDK}" ]; then
+            SRC="$(ls -d "${ANDROID_SDK_ROOT}"/platforms/android-${COMPILE_SDK}.* 2>/dev/null \
+              | sort -V | tail -1 || true)"
+            if [ -z "${SRC}" ]; then
+              echo "::error::未找到 android-${COMPILE_SDK}.* 平台目录"
+              exit 1
+            fi
+            ln -s "${SRC}" "${ANDROID_SDK_ROOT}/platforms/android-${COMPILE_SDK}"
+            echo "已创建兼容链接 android-${COMPILE_SDK} -> $(basename "${SRC}")"
+          fi
 
           # AGP 一般会自行下载匹配的 build-tools；这里预装以便命中缓存，失败不阻断
-          sdkmanager --channel="${INSTALLED}" --install "build-tools;${BUILD_TOOLS}" >/dev/null 2>&1 \
+          sdkmanager --channel=3 --install "build-tools;${BUILD_TOOLS}" >/dev/null 2>&1 \
             || echo "::warning::build-tools;${BUILD_TOOLS} 预装失败，交由 AGP 自动下载"
 
       - name: 准备签名材料与混淆字典
