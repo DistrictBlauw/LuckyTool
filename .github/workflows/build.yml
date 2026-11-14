@@ -1,0 +1,205 @@
+# LuckyTool CI 构建
+#
+# 安全约定：
+#   - 本文件及配套脚本中绝不出现任何明文 Token / 密钥，一律通过 GitHub Secrets 注入。
+#   - 构建与上传产物使用 GitHub 自动提供的 secrets.GITHUB_TOKEN（本仓库 contents: write）。
+#   - secrets.LUCKYTOOL_CI_PAT 仅用于「可选的跨仓库通知」步骤；未配置时该步骤自动跳过，
+#     基础构建不依赖任何 PAT。请勿把 PAT 写进代码、日志或 workflow 文件。
+#
+# 需要配置的 Secrets（Settings → Secrets and variables → Actions）：
+#   KEYSTORE_BASE64      签名文件 release.jks 的 base64（可选，缺省时自动生成临时 debug keystore）
+#   KEYSTORE_PASSWORD    密钥库口令（配合上一项）
+#   KEY_ALIAS            别名
+#   KEY_PASSWORD         密钥口令
+#   LUCKYTOOL_CI_PAT     可选，仅用于通知外部发布仓库（repo 权限的 fine-grained PAT）
+# 可选 Variables：
+#   PUBLISH_REPO         跨仓库通知目标，默认 Xposed-Modules-Repo/com.luckyzyx.luckytool
+#
+# 已知的项目构建约束（见 .github/scripts/prepare-signing.sh 注释）：
+#   1. 根 build.gradle.kts 用 FileInputStream 强制读取 keystore/keystore.properties，缺文件即配置失败；
+#   2. app/build.gradle.kts 中 storeFile = file(...) 相对 app/ 目录，故路径需写成 ../keystore/xxx；
+#   3. getVersionCode() 每次 Gradle 配置都会自增并写回 app/version.properties，构建后需恢复；
+#   4. compileSdk/targetSdk = 37，且 BuildVersionUtils.kt 引用 Build.VERSION_CODES.CINNAMON_BUN
+#      （API 37 常量），必须安装 Android SDK Platform 37，降级到 36 会直接编译失败。
+
+name: Build LuckyTool
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*', 'LuckyTool_v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: '构建变体（debug / release / all）'
+        required: true
+        default: 'all'
+        type: choice
+        options: [debug, release, all]
+      publish_release:
+        description: '构建后创建/更新 GitHub Release'
+        default: false
+        type: boolean
+      sdk_channel:
+        description: 'SDK 更新渠道（0=稳定版，1=预览版；SDK 37 未进稳定渠道时选 1）'
+        required: true
+        default: '0'
+        type: choice
+        options: ['0', '1']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '21'
+  COMPILE_SDK: '37'
+  BUILD_TOOLS: '36.0.0'
+  ARTIFACT_NAME: LuckyTool-${{ github.run_number }}
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g'
+
+jobs:
+  build:
+    name: 构建 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 准备 JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: 安装 Android 命令行工具
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 平台与构建工具
+        env:
+          # 非 workflow_dispatch 触发时为空串，脚本按稳定渠道处理
+          SDK_CHANNEL: ${{ inputs.sdk_channel || '0' }}
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          CHANNEL="${SDK_CHANNEL:-0}"
+
+          if ! sdkmanager --channel="${CHANNEL}" \
+              --install "platforms;android-${COMPILE_SDK}" "platform-tools" >/dev/null 2>&1; then
+            echo "::error::无法安装 platforms;android-${COMPILE_SDK}（渠道 ${CHANNEL}）。"
+            echo "::error::本项目 gradle.properties 指定 compileSdk/targetSdk=37，且 BuildVersionUtils.kt"
+            echo "::error::引用 Build.VERSION_CODES.CINNAMON_BUN（API 37 常量），降级到 SDK 36 无法编译。"
+            echo "::error::请在 workflow_dispatch 中把 sdk_channel 设为 1（预览渠道）重试，或改用含 SDK 37 的镜像。"
+            exit 1
+          fi
+          echo "已安装 platforms;android-${COMPILE_SDK}（渠道 ${CHANNEL}）"
+
+          # AGP 一般会自行下载匹配的 build-tools；这里预装以便命中缓存，失败不阻断
+          sdkmanager --channel="${CHANNEL}" --install "build-tools;${BUILD_TOOLS}" >/dev/null 2>&1 \
+            || echo "::warning::build-tools;${BUILD_TOOLS} 预装失败，交由 AGP 自动下载"
+
+      - name: 准备签名材料与混淆字典
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: bash .github/scripts/prepare-signing.sh
+
+      - name: 构建 APK
+        env:
+          # 非 workflow_dispatch 触发时为空串，case 的 * 分支按 all 处理
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          case "${VARIANT}" in
+            debug)   TASKS=":app:assembleDebug" ;;
+            release) TASKS=":app:assembleRelease" ;;
+            *)       TASKS=":app:assemble" ;;
+          esac
+          echo "::group::./gradlew ${TASKS}"
+          ./gradlew ${TASKS} --no-daemon --stacktrace
+          echo "::endgroup::"
+
+      - name: 列出产物并计算校验和
+        run: |
+          set -euo pipefail
+          find app/build/outputs/apk -name '*.apk' -type f -print -exec sha256sum {} \;
+
+      - name: 恢复被 Gradle 自增改写的版本号文件
+        if: always()
+        run: |
+          # app/build.gradle.kts 的 getVersionCode() 每次配置都会 +1 并写回该文件，
+          # 属于构建副作用，不应留在工作区（CI 中也不会被提交）。
+          git checkout -- app/version.properties 2>/dev/null || true
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 发布 Release（可选）
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # job 级 env 才能在 step 的 if 中判断；未配置时为空串，可选步骤自动跳过
+      CI_PAT: ${{ secrets.LUCKYTOOL_CI_PAT }}
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
+      - name: 创建或更新 Release（内置 GITHUB_TOKEN，无需 PAT）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find dist -name '*.apk' -type f)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::未找到 APK 产物"
+            exit 1
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="ci-${{ github.run_number }}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${APKS[@]}" --clobber
+          else
+            gh release create "$TAG" "${APKS[@]}" --generate-notes --title "LuckyTool $TAG"
+          fi
+
+      - name: 可选：用 CI PAT 通知外部发布仓库
+        # 仅在配置了 secrets.LUCKYTOOL_CI_PAT 时执行；失败不影响本次构建结果
+        if: env.CI_PAT != ''
+        continue-on-error: true
+        env:
+          PUBLISH_REPO: ${{ vars.PUBLISH_REPO || 'Xposed-Modules-Repo/com.luckyzyx.luckytool' }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${CI_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PUBLISH_REPO}/dispatches" \
+            -d '{"event_type":"luckytool-build-ready"}'
+          echo "已向 ${PUBLISH_REPO} 发送 repository_dispatch"
