@@ -81,30 +81,50 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      - name: 安装 Android 命令行工具
-        uses: android-actions/setup-android@v3
-
+      # 不使用 android-actions/setup-android@v3：它会因为镜像自带 cmdline-tools 版本不符
+      # 而下载旧版 16.0，再执行 sdkmanager --install "tools"，但 "tools" 包已从 SDK 仓库移除，
+      # 必然以 exit 1 失败（实测日志：Failed to find package 'tools'）。
+      # ubuntu-latest 镜像自带完整的 Android SDK 与 cmdline-tools/latest，直接复用即可。
       - name: 安装 SDK 平台与构建工具
         env:
           # 非 workflow_dispatch 触发时为空串，脚本按稳定渠道处理
           SDK_CHANNEL: ${{ inputs.sdk_channel || '0' }}
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          CHANNEL="${SDK_CHANNEL:-0}"
 
-          if ! sdkmanager --channel="${CHANNEL}" \
-              --install "platforms;android-${COMPILE_SDK}" "platform-tools" >/dev/null 2>&1; then
-            echo "::error::无法安装 platforms;android-${COMPILE_SDK}（渠道 ${CHANNEL}）。"
-            echo "::error::本项目 gradle.properties 指定 compileSdk/targetSdk=37，且 BuildVersionUtils.kt"
-            echo "::error::引用 Build.VERSION_CODES.CINNAMON_BUN（API 37 常量），降级到 SDK 36 无法编译。"
-            echo "::error::请在 workflow_dispatch 中把 sdk_channel 设为 1（预览渠道）重试，或改用含 SDK 37 的镜像。"
+          ANDROID_SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_SDK_ROOT ANDROID_HOME="${ANDROID_SDK_ROOT}"
+          for d in "${ANDROID_SDK_ROOT}"/cmdline-tools/*/bin; do
+            if [ -d "${d}" ]; then export PATH="${d}:${PATH}"; fi
+          done
+          export PATH="${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
+          command -v sdkmanager >/dev/null || { echo "::error::未找到 sdkmanager"; exit 1; }
+          echo "sdkmanager: $(command -v sdkmanager)"
+          sdkmanager --version
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          CHANNEL="${SDK_CHANNEL:-0}"
+          # 依次尝试稳定渠道与预览渠道；SDK 37 若尚未进入稳定渠道，靠后面的渠道兜底
+          CANDIDATES="${CHANNEL} 0 1 2 3"
+          INSTALLED=""
+          for c in ${CANDIDATES}; do
+            if sdkmanager --channel="${c}" \
+                --install "platforms;android-${COMPILE_SDK}" "platform-tools" >/dev/null 2>&1; then
+              INSTALLED="${c}"
+              break
+            fi
+          done
+          if [ -z "${INSTALLED}" ]; then
+            echo "::error::无法安装 platforms;android-${COMPILE_SDK}（已尝试渠道 ${CANDIDATES}）。"
+            echo "::error::本项目 compileSdk/targetSdk=37 且引用 API 37 常量，降级到 SDK 36 无法编译。"
+            sdkmanager --channel=3 --list 2>&1 | grep -i "android-37" | head -10 || true
             exit 1
           fi
-          echo "已安装 platforms;android-${COMPILE_SDK}（渠道 ${CHANNEL}）"
+          echo "已安装 platforms;android-${COMPILE_SDK}（渠道 ${INSTALLED}）"
 
           # AGP 一般会自行下载匹配的 build-tools；这里预装以便命中缓存，失败不阻断
-          sdkmanager --channel="${CHANNEL}" --install "build-tools;${BUILD_TOOLS}" >/dev/null 2>&1 \
+          sdkmanager --channel="${INSTALLED}" --install "build-tools;${BUILD_TOOLS}" >/dev/null 2>&1 \
             || echo "::warning::build-tools;${BUILD_TOOLS} 预装失败，交由 AGP 自动下载"
 
       - name: 准备签名材料与混淆字典
